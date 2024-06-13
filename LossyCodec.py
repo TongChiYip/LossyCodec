@@ -25,6 +25,9 @@ class Encoder:
         # 对图像进行DCT编码
         img = self._dct_encode(img, q)
 
+        img = self._rle_encode(img)
+        img = np.array(img)
+
         # 对图像进行哈夫曼编码
         self._huffman_encode(img.reshape([-1]))
 
@@ -106,6 +109,71 @@ class Encoder:
                                  c] = coef / Ccoef / q
         return DCT_coef.astype(np.int32)
 
+    # RLE编码
+    def _rle_encode(self, image: np.ndarray):
+        def zigzag_serialize(matrix):
+            # if not matrix or not matrix[0]:
+            #     return []
+
+            rows, cols = len(matrix), len(matrix[0])
+            result = []
+            up = True
+
+            row, col = 0, 0
+            while row < rows and col < cols:
+                result.append(matrix[row][col])
+                new_row = row + (-1 if up else 1)
+                new_col = col + (1 if up else -1)
+
+                if new_row >= rows or new_row < 0 or new_col >= cols or new_col < 0:
+                    if up:
+                        if col + 1 < cols:
+                            col += 1
+                        else:
+                            row += 1
+                    else:
+                        if row + 1 < rows:
+                            row += 1
+                        else:
+                            col += 1
+                    up = not up
+                else:
+                    row, col = new_row, new_col
+
+            return result
+
+        def rle_encode_numeric(data):
+            if not data:
+                return []
+
+            encoding = []
+            prev_num = data[0]
+            count = 1
+
+            for num in data[1:]:
+                if num == prev_num:
+                    count += 1
+                else:
+                    encoding.append(prev_num)
+                    encoding.append(count)
+                    prev_num = num
+                    count = 1
+            encoding.append(prev_num)
+            encoding.append(count)
+            return encoding
+
+        h, w = image.shape[:2]
+        res = []
+        for c in range(3):
+            for i in range(h // 8):
+                for j in range(w // 8):
+                    block = image[i*8:(i+1)*8, j*8:(j+1)*8, c]
+                    zig_block = zigzag_serialize(block)
+                    rle_block = rle_encode_numeric(zig_block)
+                    res.extend(rle_block)
+        return res
+
+
     # 哈夫曼编码
     def _huffman_encode(self, sig: np.ndarray):
         # 统计图像信息，得到每个像素值的分布概率
@@ -132,13 +200,18 @@ class Encoder:
             self.outer.out(uint2bin(k+255, depth=9))
             self.outer.out(uint2bin(len(huffman_dict[k]), depth=5))
             self.outer.out(huffman_dict[k])
+
         # 以二进制码1 1111 1111作为EOF，分割哈夫曼表区与图像编码区
         self.outer.out(uint2bin(511, depth=9))
+        # 将图像的长度写入码流
+        self.outer.out(uint2bin(len(sig), depth=32))
         # 将三通道图像展开成向量，进行编码
         sig = np.reshape(sig, [-1])
         # 将每个像素按照哈夫曼编码，写入码流
         for i in tqdm(range(len(sig)), "编码图像"):
             self.outer.out(huffman_dict[sig[i]])
+
+        return
 
 
 # 解码器的建立
@@ -161,6 +234,8 @@ class Decoder:
         img = self._huffman_decode(dct_h, dct_w)
 
         self.inner.close()
+
+        img = self._rle_decode(img, dct_h, dct_w)
 
         # 对差分图像进行DCT解码
         img = self._dct_decode(img, q)
@@ -208,22 +283,88 @@ class Decoder:
             # 将键值对写入哈夫曼表
             huffman_dict[code] = symb
 
+        # 读取图像的长度
+        bits = tuple()
+        for _ in range(32):
+            bits = bits + self.inner.in_()
+        img_len = bin2uint(bits)
+
         # 开始读取图像
-        img = np.zeros([height*width*3], dtype=np.int16)
+        img = []
         codes = huffman_dict.keys()
         bits = tuple()
-        for cnt in tqdm(range(height*width*3), "解码图像"):
+        while True:
             while True:
                 bits = bits + self.inner.in_()
                 # 当文件读取完毕时，self.inner会返回空值，并将self.inner.current_byte设置为-1
                 # 用这种方法防止溢出
-                if (self.inner.current_byte == -1) or (bits in codes):
+                if (self.inner.current_byte == -1):
+                    bits = bits + self.inner.in_()
+                    break
+                if bits in codes:
                     break
             # 生成图像
-            if not self.inner.current_byte == -1:
-                img[cnt] = huffman_dict[bits]
+            if bits in codes:
+                img.append(huffman_dict[bits])
+            if self.inner.current_byte == -1:
+                break
             bits = tuple()
-        return img.reshape([height, width, 3])
+        while len(img) > img_len:
+            img.pop()
+        return np.array(img)
+
+    def _rle_decode(self, img: np.ndarray, height: int, width: int):
+        def rle_decode_numeric(encoded_data):
+            decoded = []
+            n = len(encoded_data)
+            for i in range(0, n, 2):
+                decoded.extend([encoded_data[i]] * encoded_data[i + 1])
+            return decoded
+
+        def zigzag_deserialize(serialized, rows, cols):
+            if not serialized:
+                return []
+
+            matrix = [[0] * cols for _ in range(rows)]
+            up = True
+
+            index = 0
+            row, col = 0, 0
+            while row < rows and col < cols:
+                matrix[row][col] = serialized[index]
+                index += 1
+                new_row = row + (-1 if up else 1)
+                new_col = col + (1 if up else -1)
+
+                if new_row >= rows or new_row < 0 or new_col >= cols or new_col < 0:
+                    if up:
+                        if col + 1 < cols:
+                            col += 1
+                        else:
+                            row += 1
+                    else:
+                        if row + 1 < rows:
+                            row += 1
+                        else:
+                            col += 1
+                    up = not up
+                else:
+                    row, col = new_row, new_col
+
+            return matrix
+
+        img = rle_decode_numeric(img)
+        res = np.zeros([height, width, 3], dtype=np.int16)
+        idx = 0
+        for c in range(3):
+            for i in range(height // 8):
+                for j in range(width // 8):
+
+                    res[i * 8:(i + 1) * 8, j * 8:(j + 1) * 8, c] = zigzag_deserialize(img[idx : idx + 64], 8, 8)
+                    idx += 64
+        return res
+
+
 
     # DCT解码
     def _dct_decode(self, DCT_coef: np.ndarray, q):
